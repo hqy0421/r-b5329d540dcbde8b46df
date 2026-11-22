@@ -74,11 +74,11 @@ A feature-by-feature catalog. The exhaustive, link-rich version lives in [`docs/
 
 | Capability | What it does |
 | --- | --- |
-| **Logical replication** | Reads a publication + replication slot, decodes `pgoutput` v2 (I/U/D). No triggers, no app changes. |
+| **Logical replication** | Reads a publication + replication slot, decodes `pgoutput` v2 (I/U/D + TRUNCATE). No triggers, no app changes. |
 | **Consistent initial snapshot** | `init` exports a snapshot at one LSN via `CREATE_REPLICATION_SLOT`; per-table `COPY` under `SET TRANSACTION SNAPSHOT`. Cross-table parallelism (`init.parallel_workers`). |
 | **Streaming WAL → delta Parquet** | `start` daemon buffers events and flushes typed Parquet per table on interval / row / **byte** budget. Per-table parallel flush. |
 | **Schema evolution** | Detects `ADD/DROP COLUMN`, propagates to manifest + Glue + Iceberg live — no restart. `reconcile --table` one-shot for hot tables. |
-| **Compaction** | `compact` merges delta epochs into a new base, applies I/U/D, soft-deletes on a tombstone TTL. CAS-safe alongside the live streamer. |
+| **Compaction** | `compact` merges delta epochs into a new base, applies I/U/D, tombstones whole-table TRUNCATE boundaries, soft-deletes on a tombstone TTL. CAS-safe alongside the live streamer. |
 | **TOAST partial-row preservation** | Honors `TupleDataType 'u'` — unchanged TOAST columns keep their value instead of silently becoming NULL. |
 | **Versioned manifest** | A single JSON source of truth (active tables, schema versions, epoch markers, source LSN), CAS-committed on S3. |
 
@@ -168,7 +168,7 @@ The differentiator. pg-cdc doesn't just land data — it makes it **default-deny
 pg-cdc preflight                  # Verify the source is ready for logical replication (managed-aware)
 pg-cdc init                       # Snapshot tables → base Iceberg/Parquet + manifest + catalog + ACL registration
 pg-cdc start                      # Stream WAL → delta epochs (the long-running daemon)
-pg-cdc compact                    # Merge deltas → new base (applies I/U/D, soft-deletes on tombstone TTL)
+pg-cdc compact                    # Merge deltas → new base (applies I/U/D + TRUNCATE, soft-deletes on tombstone TTL)
 pg-cdc status                     # Health: slot, lag, LSN, epochs, tables, oldest source txn
 pg-cdc discover [--acl] [--dry-run]      # List tables (+ role→table→column access map with --acl)
 pg-cdc reconcile [--table <q>] --force   # One-shot schema reconcile after an ALTER on a hot table

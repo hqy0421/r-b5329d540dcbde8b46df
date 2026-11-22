@@ -10,6 +10,8 @@ pg-cdc init
   2. Discover tables in configured schemas
   3. Apply tags + policies → filter included/excluded
   4. CREATE PUBLICATION for included tables only
+     (WITH publish = 'insert, update, delete, truncate'; an existing
+     publication is ALTERed to include truncate rather than recreated)
   5. CREATE_REPLICATION_SLOT → capture LSN + export snapshot
   6. For each included table:
      SET TRANSACTION SNAPSHOT → COPY → typed Parquet

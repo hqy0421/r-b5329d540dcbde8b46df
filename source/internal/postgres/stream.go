@@ -13,7 +13,7 @@ import (
 // CDCEvent represents a single change captured from WAL.
 type CDCEvent struct {
 	Table     string         // qualified table name (schema.table)
-	Op        string         // "I", "U", "D"
+	Op        string         // "I", "U", "D", or "T" (truncate; Row is nil)
 	Row       map[string]any // column values
 	LSN       string
 	Timestamp time.Time
@@ -113,6 +113,16 @@ func (c *Conn) Stream(ctx context.Context, slotName, publicationName, startLSN s
 			walEnd := xld.WALStart + pglogrepl.LSN(len(xld.WALData))
 			if walEnd > serverWALEnd {
 				serverWALEnd = walEnd
+			}
+
+			// Forward any events the previous WAL message fanned out
+			// (multi-relation TRUNCATE) before decoding the next one.
+			for _, queued := range decoder.DrainPending() {
+				select {
+				case events <- *queued:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
 
 			evt, err := decoder.decode(xld.WALData, xld.WALStart.String(), xld.ServerTime)

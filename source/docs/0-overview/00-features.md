@@ -19,7 +19,8 @@ A single-binary PostgreSQL change-data-capture daemon that streams WAL into type
 ### Postgres logical replication
 Reads WAL from a publication + replication slot, decodes `pgoutput` v2 messages, emits per-row change events. The canonical Postgres replica pattern; no triggers, no application changes.
 - [x] Publication + slot lifecycle managed by `pg-cdc init` / `teardown`
-- [x] `pgoutput` v2 decoder for INSERT / UPDATE / DELETE
+- [x] `pgoutput` v2 decoder for INSERT / UPDATE / DELETE / TRUNCATE (a TRUNCATE message fans out to one boundary event per relation)
+- [x] Publication created with `publish = 'insert, update, delete, truncate'` so daily reload (`TRUNCATE` + re-import) is captured; existing publications are upgraded in place
 - [x] Replica-identity validation at init (fail-loud on `REPLICA IDENTITY NOTHING`)
 - [x] Source LSN tracked in manifest as the consistent starting point
 
@@ -48,7 +49,7 @@ Long-running daemon that consumes the replication slot, buffers events, and flus
 - [x] Detailed phase docs in [`04-streaming.md`](04-streaming.md)
 
 ### Compaction
-Merges delta epochs into a new base snapshot, applies I/U/D semantics, expires soft-deletes on a configurable TTL.
+Merges delta epochs into a new base snapshot, applies I/U/D semantics, tombstones whole-table TRUNCATE boundaries (re-inserts after the boundary stay live), expires soft-deletes on a configurable TTL.
 - [x] `pg-cdc compact` subcommand (also wired to a systemd timer — see Operability)
 - [x] Tombstone TTL (default 30 days, configurable)
 - [x] Iceberg snapshot expiration (default retain 100 per table)

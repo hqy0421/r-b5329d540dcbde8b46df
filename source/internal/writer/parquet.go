@@ -23,18 +23,40 @@ type Row = map[string]any
 // WriteBaseParquet writes rows to a base Parquet file using parquet-go.
 // All values are written as strings/bytes for simplicity in v0.1.
 // Downstream consumers (pg-warehouse) handle type coercion via DuckDB's read_parquet.
+//
+// The __deleted_at tombstone column is retained on base files (as an optional
+// UTF8 column). Compaction stamps it on row-level DELETEs and TRUNCATE
+// boundaries; the TTL purge reads it back on the next compaction. Filtering
+// it out here would silently resurrect every deleted/truncated row.
 func WriteBaseParquet(path string, rows []Row, columns []manifest.Column) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("create directory: %w", err)
 	}
 
-	// Filter out CDC metadata columns
+	// Filter out delta-only metadata columns, but keep __deleted_at so
+	// tombstones survive into the base snapshot.
 	var dataCols []manifest.Column
 	for _, col := range columns {
-		if col.Name == btypes.ColOp || col.Name == btypes.ColEpoch || col.Name == btypes.ColDeletedAt {
+		if col.Name == btypes.ColOp || col.Name == btypes.ColEpoch {
 			continue
 		}
 		dataCols = append(dataCols, col)
+	}
+
+	// Append the tombstone column when any row carries one. It is absent from
+	// the manifest schema (it is CDC metadata, not source data), so it is
+	// declared here explicitly as optional text.
+	hasTombstone := false
+	for _, r := range rows {
+		if v, ok := r[btypes.ColDeletedAt]; ok && v != nil {
+			hasTombstone = true
+			break
+		}
+	}
+	if hasTombstone {
+		dataCols = append(dataCols, manifest.Column{
+			Name: btypes.ColDeletedAt, PgType: "text", ParquetType: "UTF8", Nullable: true,
+		})
 	}
 
 	return writeParquetFile(path, rows, dataCols)
@@ -271,4 +293,3 @@ func toString(v any) string {
 		return fmt.Sprintf("%v", val)
 	}
 }
-

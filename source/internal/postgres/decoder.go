@@ -7,13 +7,34 @@ import (
 	"github.com/jackc/pglogrepl"
 )
 
+// OpTruncate is the CDC operation code for a TRUNCATE boundary. Unlike
+// I/U/D it carries no row data: the whole relation was emptied at this LSN.
+const OpTruncate = "T"
+
 // decoder translates pgoutput v2 WAL messages into CDCEvents.
 type decoder struct {
 	relations map[uint32]*pglogrepl.RelationMessageV2
+	// pending holds events produced by one WAL message that fans out to
+	// multiple relations (today: multi-relation TRUNCATE). DrainPending
+	// must be consumed before decoding the next WAL message.
+	pending []*CDCEvent
 }
 
 func newDecoder() *decoder {
 	return &decoder{relations: make(map[uint32]*pglogrepl.RelationMessageV2)}
+}
+
+// DrainPending returns boundary events buffered by the previous decode call
+// (e.g. the 2nd..Nth relations of a multi-table TRUNCATE). The stream loop
+// forwards these before reading the next WAL message so event order matches
+// the WAL order.
+func (d *decoder) DrainPending() []*CDCEvent {
+	if len(d.pending) == 0 {
+		return nil
+	}
+	out := d.pending
+	d.pending = nil
+	return out
 }
 
 func (d *decoder) decode(walData []byte, lsn string, ts time.Time) (*CDCEvent, error) {
@@ -78,7 +99,32 @@ func (d *decoder) decode(walData []byte, lsn string, ts time.Time) (*CDCEvent, e
 	case *pglogrepl.OriginMessage:
 		return nil, nil
 	case *pglogrepl.TruncateMessageV2:
-		return nil, nil
+		// A single TRUNCATE WAL message can cover several relations
+		// (TRUNCATE a, b / CASCADE). Emit one boundary event per relation
+		// the decoder has already seen. Relations are resolved via the
+		// RelationMessageV2 catalog, exactly like I/U/D.
+		var events []*CDCEvent
+		for _, relID := range m.RelationIDs {
+			rel := d.relations[relID]
+			if rel == nil {
+				continue
+			}
+			events = append(events, &CDCEvent{
+				Table:     fmt.Sprintf("%s.%s", rel.Namespace, rel.RelationName),
+				Op:        OpTruncate,
+				Row:       nil,
+				LSN:       lsn,
+				Timestamp: ts,
+			})
+		}
+		if len(events) == 0 {
+			return nil, nil
+		}
+		// decode returns a single event; callers expecting one event per WAL
+		// message are served the first relation, and any remainder is handed
+		// back through the decoder's queued channel.
+		d.pending = append(d.pending, events[1:]...)
+		return events[0], nil
 	case *pglogrepl.StreamStartMessageV2:
 		return nil, nil
 	case *pglogrepl.StreamStopMessageV2:

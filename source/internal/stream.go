@@ -75,7 +75,7 @@ func Start(ctx context.Context, cfg config.Config, source ports.Source, sink por
 		case evt, ok := <-events:
 			if !ok {
 				// Stream closed — flush remaining
-				if err := buffer.flush(ctx); err != nil {
+				if err := buffer.flushThenCompact(ctx); err != nil {
 					fmt.Printf("flush error: %v\n", err)
 				}
 				wg.Wait()
@@ -83,26 +83,65 @@ func Start(ctx context.Context, cfg config.Config, source ports.Source, sink por
 			}
 			buffer.add(evt)
 			if buffer.count() >= flushMaxRows {
-				if err := buffer.flush(ctx); err != nil {
+				if err := buffer.flushThenCompact(ctx); err != nil {
 					fmt.Printf("flush error: %v\n", err)
 				}
 			}
 
 		case <-flushTicker.C:
 			if buffer.count() > 0 {
-				if err := buffer.flush(ctx); err != nil {
+				if err := buffer.flushThenCompact(ctx); err != nil {
 					fmt.Printf("flush error: %v\n", err)
 				}
 			}
 
 		case <-ctx.Done():
-			if err := buffer.flush(ctx); err != nil {
+			if err := buffer.flushThenCompact(ctx); err != nil {
 				fmt.Printf("flush error: %v\n", err)
 			}
 			wg.Wait()
 			return ctx.Err()
 		}
 	}
+}
+
+// flushThenCompact flushes buffered events and, when the flush included a
+// TRUNCATE boundary, immediately compacts the affected tables. Driving
+// compaction from here keeps the base snapshot consistent with Postgres:
+// a table emptied at LSN X must not keep serving its pre-truncation rows
+// through the base after the truncation is durable in the sink.
+//
+// Compaction failures are reported but do not fail the flush — the delta
+// (including its T boundary) is already durable, so a later `pg-cdc
+// compact` converges to the same state.
+func (b *eventBuffer) flushThenCompact(ctx context.Context) error {
+	if err := b.flush(ctx); err != nil {
+		return err
+	}
+	truncated := b.takeTruncated()
+	if len(truncated) == 0 {
+		return nil
+	}
+	if err := CompactTables(ctx, b.sink, truncated); err != nil {
+		return fmt.Errorf("post-truncate compact: %w (delta is durable; rerun `pg-cdc compact` to converge)", err)
+	}
+
+	// CompactTables advanced BaseEpoch/RowCount in the sink manifest. The
+	// buffer's in-memory manifest still holds the pre-compaction values, so
+	// without refreshing them the next flush's WriteManifest would regress
+	// BaseEpoch and make a later compact re-scan already-deleted deltas.
+	// Adopt the post-compaction manifest (a strict superset: it was read
+	// after this flush wrote its LatestDeltaEpoch/schemas) and rebuild the
+	// active-table index the flush loop mutates.
+	refreshed, err := b.sink.ReadManifest(ctx)
+	if err != nil {
+		return fmt.Errorf("re-read manifest after compact: %w", err)
+	}
+	b.mu.Lock()
+	b.manifest = refreshed
+	b.tables = refreshed.ActiveTables()
+	b.mu.Unlock()
+	return nil
 }
 
 // eventBuffer collects CDC events and flushes them as epoch Parquet files.
@@ -112,7 +151,11 @@ type eventBuffer struct {
 	manifest *manifest.Manifest
 	tables   map[string]manifest.Table
 	events   []ports.CDCEvent
-	mu       sync.Mutex
+	// truncatedTables is populated by flush when a delta contains a TRUNCATE
+	// boundary. The Start loop reads it to run compaction right away so the
+	// base snapshot never serves rows that were truncated in Postgres.
+	truncatedTables []string
+	mu              sync.Mutex
 }
 
 // evolveSchema checks events for columns not present in the manifest schema
@@ -130,9 +173,13 @@ func (b *eventBuffer) evolveSchema(ctx context.Context, tableName string, events
 		known[c.Name] = struct{}{}
 	}
 
-	// Collect unknown column names, skipping CDC metadata.
+	// Collect unknown column names, skipping CDC metadata. TRUNCATE events
+	// carry no row, so they can never introduce a column.
 	unknown := make(map[string]struct{})
 	for _, evt := range events {
+		if evt.Op == opTruncate {
+			continue
+		}
 		for k := range evt.Row {
 			if k == btypes.ColOp || k == btypes.ColEpoch || k == btypes.ColDeletedAt {
 				continue
@@ -195,6 +242,17 @@ func (b *eventBuffer) count() int {
 	return len(b.events)
 }
 
+// takeTruncated returns the tables whose just-flushed delta contained a
+// TRUNCATE boundary, clearing the record. The caller drives compaction over
+// exactly these tables so the base reflects the truncation immediately.
+func (b *eventBuffer) takeTruncated() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.truncatedTables
+	b.truncatedTables = nil
+	return out
+}
+
 func (b *eventBuffer) flush(ctx context.Context) error {
 	b.mu.Lock()
 	if len(b.events) == 0 {
@@ -221,6 +279,7 @@ func (b *eventBuffer) flush(ctx context.Context) error {
 	nextEpoch := maxEpoch + 1
 
 	// Write delta Parquet for each table
+	b.truncatedTables = b.truncatedTables[:0]
 	for tableName, tableEvents := range byTable {
 		table, ok := b.tables[tableName]
 		if !ok {
@@ -233,8 +292,10 @@ func (b *eventBuffer) flush(ctx context.Context) error {
 			fmt.Printf("  schema refresh failed for %s: %v\n", tableName, err)
 		}
 
-		// Build rows with __op
+		// Build rows with __op. A TRUNCATE event has no row: its Parquet
+		// row holds only __op/__epoch with every data column NULL.
 		rows := make([]writer.Row, len(tableEvents))
+		var truncated bool
 		for i, evt := range tableEvents {
 			row := make(writer.Row, len(evt.Row)+1)
 			row[btypes.ColOp] = evt.Op
@@ -242,6 +303,9 @@ func (b *eventBuffer) flush(ctx context.Context) error {
 				row[k] = v
 			}
 			rows[i] = row
+			if evt.Op == opTruncate {
+				truncated = true
+			}
 		}
 
 		// Get column definitions from manifest schema
@@ -269,6 +333,10 @@ func (b *eventBuffer) flush(ctx context.Context) error {
 		t.LatestDeltaEpoch = nextEpoch
 		b.manifest.Tables[tableName] = t
 		b.tables[tableName] = t
+
+		if truncated {
+			b.truncatedTables = append(b.truncatedTables, tableName)
+		}
 
 		fmt.Printf("  epoch %d: %s (%d events)\n", nextEpoch, tableName, len(tableEvents))
 	}

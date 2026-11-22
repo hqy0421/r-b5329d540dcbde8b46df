@@ -17,17 +17,43 @@ import (
 	goparquet "github.com/parquet-go/parquet-go"
 )
 
+// opTruncate mirrors stream.go: a delta row with __op="T" is a TRUNCATE
+// boundary — the whole relation was emptied at that epoch.
+const opTruncate = "T"
+
 // Compact merges delta Parquet files into a new base snapshot for each table.
-// Applies INSERT/UPDATE/DELETE operations, maintains tombstones with TTL.
+// Applies INSERT/UPDATE/DELETE/TRUNCATE operations, maintains tombstones with TTL.
 func Compact(ctx context.Context, sink ports.Sink) error {
+	return CompactTables(ctx, sink, nil)
+}
+
+// CompactTables compacts only the named tables (qualified names). An empty
+// list compacts every active table, which is the behaviour of `pg-cdc
+// compact`. The streaming path passes the tables whose latest delta carries
+// a TRUNCATE boundary so their base converges immediately.
+func CompactTables(ctx context.Context, sink ports.Sink, tableNames []string) error {
 	m, err := sink.ReadManifest(ctx)
 	if err != nil {
 		return fmt.Errorf("read manifest: %w", err)
 	}
 
-	fmt.Printf("Compacting %d tables\n", len(m.ActiveTables()))
+	active := m.ActiveTables()
+	targets := active
+	if len(tableNames) > 0 {
+		targets = make(map[string]manifest.Table, len(tableNames))
+		for _, name := range tableNames {
+			t, ok := active[name]
+			if !ok {
+				fmt.Printf("  %s: skip (not an active table in manifest)\n", name)
+				continue
+			}
+			targets[name] = t
+		}
+	}
 
-	for tableName, table := range m.ActiveTables() {
+	fmt.Printf("Compacting %d tables\n", len(targets))
+
+	for tableName, table := range targets {
 		if table.LatestDeltaEpoch <= table.BaseEpoch {
 			fmt.Printf("  %s: up to date (base=%d, latest=%d)\n", tableName, table.BaseEpoch, table.LatestDeltaEpoch)
 			continue
@@ -90,7 +116,8 @@ func compactTable(ctx context.Context, sink ports.Sink, m *manifest.Manifest, ta
 		return nil
 	}
 
-	var applied int
+	var applied, truncated int
+	truncateAt := time.Now().UTC()
 	for _, deltaFile := range newDeltas {
 		deltaRows, err := readParquetRows(ctx, sink, deltaFile)
 		if err != nil {
@@ -110,12 +137,32 @@ func compactTable(ctx context.Context, sink ports.Sink, m *manifest.Manifest, ta
 					}
 					clean[k] = v
 				}
+				// A re-insert after a TRUNCATE (or after a row-level D)
+				// must resurrect the row: never carry a stale tombstone
+				// into the new base, or the TTL purge would remove live
+				// data 30 days later.
+				delete(clean, btypes.ColDeletedAt)
 				indexed[key] = clean
 			case "D":
 				if existing, ok := indexed[key]; ok {
 					existing[btypes.ColDeletedAt] = time.Now().UTC().Format(time.RFC3339)
 					indexed[key] = existing
 				}
+			case opTruncate:
+				// TRUNCATE empties the whole relation. Every row still
+				// visible at this boundary becomes a tombstone rather than
+				// being hard-deleted: the existing 30-day TTL then purges
+				// them, and rows already carrying __deleted_at keep their
+				// original timestamp. Rows inserted/updated AFTER this
+				// boundary land in `indexed` via the I/U cases below and so
+				// survive — this is what makes re-imported data visible.
+				for k, existing := range indexed {
+					if _, tombstoned := existing[btypes.ColDeletedAt]; !tombstoned {
+						existing[btypes.ColDeletedAt] = truncateAt.Format(time.RFC3339)
+						indexed[k] = existing
+					}
+				}
+				truncated++
 			}
 			applied++
 		}
@@ -168,8 +215,8 @@ func compactTable(ctx context.Context, sink ports.Sink, m *manifest.Manifest, ta
 		_ = sink.DeleteFile(ctx, deltaFile)
 	}
 
-	fmt.Printf("  %s: compacted %d deltas → base_%06d (%d rows, %d applied, %d purged)\n",
-		tableName, len(newDeltas), newBaseEpoch, len(indexed), applied, purged)
+	fmt.Printf("  %s: compacted %d deltas → base_%06d (%d rows, %d applied, %d truncate boundaries, %d purged)\n",
+		tableName, len(newDeltas), newBaseEpoch, len(indexed), applied, truncated, purged)
 	return nil
 }
 

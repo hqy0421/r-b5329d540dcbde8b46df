@@ -194,14 +194,26 @@ func (c *Conn) CreatePublication(ctx context.Context, pubName string, tables []s
 		}
 	}
 
-	sql := fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s",
+	// publish must name truncate explicitly: PostgreSQL's default publication
+	// parameter set is {insert, update, delete}, so without it TRUNCATE is
+	// never written to the WAL stream and the decoder's T boundary can never
+	// fire. insert/update/delete are listed too so the set is explicit and
+	// does not silently depend on server defaults.
+	sql := fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s WITH (publish = 'insert, update, delete, truncate')",
 		pgx.Identifier{pubName}.Sanitize(), strings.Join(tableList, ", "))
 
 	if _, err := conn.Exec(ctx, sql); err != nil {
-		if strings.Contains(err.Error(), "already exists") {
-			return nil
+		if !strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("create publication: %w", err)
 		}
-		return fmt.Errorf("create publication: %w", err)
+		// An older pg-cdc created this publication without the truncate
+		// publish parameter. ALTER it into the required set so TRUNCATE
+		// events flow without forcing a teardown/re-init. Idempotent.
+		alter := fmt.Sprintf("ALTER PUBLICATION %s SET (publish = 'insert, update, delete, truncate')",
+			pgx.Identifier{pubName}.Sanitize())
+		if _, err := conn.Exec(ctx, alter); err != nil {
+			return fmt.Errorf("enable truncate on existing publication %q: %w", pubName, err)
+		}
 	}
 	return nil
 }

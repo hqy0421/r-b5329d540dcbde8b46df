@@ -18,7 +18,7 @@ type ColumnInfo struct {
 // CDCEvent represents a single change captured from the source WAL.
 type CDCEvent struct {
 	Table     string         // qualified table name (schema.table)
-	Op        string         // "I" (insert), "U" (update), "D" (delete)
+	Op        string         // "I" (insert), "U" (update), "D" (delete), "T" (truncate; Row is nil)
 	Row       map[string]any // column values
 	LSN       string         // log sequence number (source-specific)
 	Timestamp time.Time

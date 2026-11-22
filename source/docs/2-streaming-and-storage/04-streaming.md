@@ -8,11 +8,12 @@
 pg-cdc start
   1. Read manifest.json for init LSN and active table list
   2. Connect to replication slot at init LSN
-  3. Decode pgoutput v2 WAL messages (INSERT/UPDATE/DELETE)
+  3. Decode pgoutput v2 WAL messages (INSERT/UPDATE/DELETE/TRUNCATE)
   4. Buffer events in memory
   5. Flush to delta Parquet on interval or row count
   6. Update manifest.json (bump latest_delta_epoch)
-  7. Send standby status to PostgreSQL (prevent WAL accumulation)
+  7. If the flush contained a TRUNCATE boundary, compact the affected table(s) immediately
+  8. Send standby status to PostgreSQL (prevent WAL accumulation)
 ```
 
 ## Usage
@@ -29,9 +30,29 @@ Each delta file contains CDC events with two metadata columns:
 
 | Column | Type | Values |
 |--------|------|--------|
-| `__op` | UTF8 | `I` (insert), `U` (update), `D` (delete) |
+| `__op` | UTF8 | `I` (insert), `U` (update), `D` (delete), `T` (truncate) |
 | `__epoch` | INT64 | Epoch number |
-| *(table columns)* | typed | PostgreSQL values (NULL for D ops except PK) |
+| *(table columns)* | typed | PostgreSQL values (NULL for D and T ops except PK) |
+
+## TRUNCATE support
+
+A daily job pattern like `TRUNCATE staging; COPY staging FROM ...` is a
+first-class event. PostgreSQL only emits TRUNCATE over logical replication
+when the publication lists it, so `init` creates (or upgrades) the
+publication with `WITH (publish = 'insert, update, delete, truncate')`.
+
+A TRUNCATE WAL message carries **no rows** — just the relations it emptied
+(one statement may cover several tables). The decoder turns it into a `T`
+delta row whose only populated columns are `__op`/`__epoch`; every data
+column is NULL. This row is the **truncation boundary** for that table.
+
+Because the boundary must not wait for the next scheduled `compact`, the
+streamer compacts the affected table as part of the same flush that
+persists the `T` delta. Compaction tombstones every row visible before the
+boundary (they still age out under the normal 30-day tombstone TTL), while
+rows inserted **after** the boundary — the re-import — are applied on top
+and stay visible. If that in-line compaction fails, the boundary delta is
+already durable and a later `pg-cdc compact` converges to the same state.
 
 ## Epochs
 
